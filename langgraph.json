@@ -1,0 +1,7 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "dating_agent": "./app/core/langgraph/studio_graph.py:graph"
+  },
+  "env": ".env.development"
+}
