@@ -1,6 +1,7 @@
 """Dating agent with router-based intent detection."""
 
 import re
+from datetime import datetime, timedelta
 from typing import Annotated, Literal, Optional
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -41,6 +42,24 @@ class CancelacionState(BaseModel):
     confirmation_number: Optional[str] = Field(default=None, description="User's confirmation number")
     validation_attempts: int = Field(default=0, description="Number of validation attempts")
     is_valid: bool = Field(default=False, description="Whether the confirmation number is valid")
+    escalated: bool = Field(default=False, description="Whether the case was escalated to human")
+
+
+class ReagendarState(BaseModel):
+    """State for the rescheduling sub-graph."""
+
+    messages: Annotated[list, add_messages] = Field(
+        default_factory=list, description="The messages in the conversation"
+    )
+    confirmation_number: Optional[str] = Field(default=None, description="User's confirmation number")
+    validation_attempts: int = Field(default=0, description="Number of validation attempts")
+    is_valid: bool = Field(default=False, description="Whether the confirmation number is valid")
+    current_booking: Optional[dict] = Field(default=None, description="Current appointment details")
+    available_slots: Optional[list] = Field(default=None, description="Available time slots")
+    selected_index: Optional[int] = Field(default=None, description="User's selected slot index")
+    selected_date: Optional[str] = Field(default=None, description="Selected date")
+    selected_time: Optional[str] = Field(default=None, description="Selected time")
+    selection_attempts: int = Field(default=0, description="Number of selection attempts")
     escalated: bool = Field(default=False, description="Whether the case was escalated to human")
 
 
@@ -115,6 +134,95 @@ async def escalate_to_human(user_id: str, session_id: str, confirmation_number: 
     return {"escalated": True, "ticket_id": ticket_id, "message": "Este caso será escalado"}
 
 
+# ============================================================================
+# TOOLS FOR RESCHEDULING
+# ============================================================================
+
+
+@tool
+async def get_available_slots(start_date: str, duration_days: int = 14) -> dict:
+    """Get available appointment slots for the next N days.
+
+    Args:
+        start_date: Starting date in YYYY-MM-DD format
+        duration_days: Number of days to fetch (default 14 for 2 weeks)
+
+    Returns:
+        dict with:
+          - slots: list of available slots with date and time
+          - total_available: int count of available slots
+    """
+    logger.info("fetching_available_slots", start_date=start_date, duration_days=duration_days)
+
+    # MOCK IMPLEMENTATION
+    # En el futuro: query a sistema de citas real del negocio
+
+    try:
+        start = datetime.strptime(start_date, "%Y-%m-%d")
+    except ValueError:
+        start = datetime.now()
+
+    slots = []
+    times = ["09:00 AM", "10:00 AM", "11:00 AM", "02:00 PM", "03:00 PM", "04:00 PM"]
+
+    # Generar slots para los próximos N días
+    for day_offset in range(1, duration_days + 1):
+        current_date = start + timedelta(days=day_offset)
+
+        # Saltar fines de semana (opcional)
+        if current_date.weekday() >= 5:  # 5 = Saturday, 6 = Sunday
+            continue
+
+        # Agregar algunos slots por día (no todos)
+        for time in times[:3]:  # Solo primeros 3 horarios por día
+            slots.append({"date": current_date.strftime("%Y-%m-%d"), "time": time})
+
+        # Limitar total de slots mostrados
+        if len(slots) >= 12:
+            break
+
+    logger.info("available_slots_fetched", total_slots=len(slots))
+
+    return {"slots": slots, "total_available": len(slots)}
+
+
+@tool
+async def update_appointment(confirmation_number: str, new_date: str, new_time: str) -> dict:
+    """Update an existing appointment with new date and time.
+
+    Args:
+        confirmation_number: The confirmation number of the appointment
+        new_date: New date in YYYY-MM-DD format
+        new_time: New time (e.g., "10:00 AM")
+
+    Returns:
+        dict with:
+          - success: bool
+          - updated_booking: dict with updated appointment details
+    """
+    logger.info(
+        "updating_appointment",
+        confirmation_number=confirmation_number,
+        new_date=new_date,
+        new_time=new_time,
+    )
+
+    # MOCK IMPLEMENTATION
+    # En el futuro: UPDATE en BD real
+
+    # Simular actualización exitosa
+    updated_booking = {
+        "confirmation_number": confirmation_number,
+        "new_date": new_date,
+        "new_time": new_time,
+        "updated_at": datetime.now().isoformat(),
+    }
+
+    logger.info("appointment_updated_successfully", confirmation_number=confirmation_number)
+
+    return {"success": True, "updated_booking": updated_booking}
+
+
 ROUTER_PROMPT = """Eres un asistente que clasifica la intención del usuario en conversaciones sobre citas médicas.
 
 Analiza el mensaje del usuario y determina:
@@ -173,12 +281,23 @@ async def agendar_node(state: DatingAgentState) -> Command:
 
 
 async def reagendar_node(state: DatingAgentState) -> Command:
-    """Nodo para manejar reagendamiento de citas."""
+    """Nodo para manejar reagendamiento de citas.
+
+    This node invokes the rescheduling sub-graph which handles the complete
+    rescheduling flow including validation, availability, and confirmation.
+    """
     logger.info("reagendar_node_executing")
 
-    response = AIMessage(content="Voy a ayudarte a reagendar tu cita.")
+    # Create the rescheduling sub-graph
+    subgraph = await create_rescheduling_subgraph()
 
-    return Command(update={"messages": [response]}, goto=END)
+    # Invoke the sub-graph with current messages
+    result = await subgraph.ainvoke({"messages": state.messages})
+
+    logger.info("reagendar_subgraph_completed", escalated=result.get("escalated", False))
+
+    # Return the updated messages from the sub-graph
+    return Command(update={"messages": result["messages"]}, goto=END)
 
 
 # ============================================================================
@@ -418,6 +537,329 @@ async def cancelar_node(state: DatingAgentState) -> Command:
 
     # Return the updated messages from the sub-graph
     return Command(update={"messages": result["messages"]}, goto=END)
+
+
+# ============================================================================
+# RESCHEDULING SUB-GRAPH NODES
+# ============================================================================
+
+
+async def ask_confirmation_number_reagendar_node(state: ReagendarState) -> Command:
+    """Ask user for their confirmation number (rescheduling context)."""
+    logger.info("ask_confirmation_number_reagendar_node_executing", attempts=state.validation_attempts)
+
+    if state.validation_attempts == 0:
+        message_content = (
+            "Para reagendar tu cita, necesito el número de confirmación. " "¿Cuál es tu número de confirmación?"
+        )
+    else:
+        message_content = (
+            "El número que proporcionaste no es válido. " "Por favor, verifica e ingresa nuevamente tu número."
+        )
+
+    response = AIMessage(content=message_content)
+    logger.info("waiting_for_confirmation_number_reagendar", attempts=state.validation_attempts)
+
+    return Command(update={"messages": [response]})
+
+
+async def extract_number_reagendar_node(state: ReagendarState) -> Command:
+    """Extract confirmation number from user's message (rescheduling)."""
+    logger.info("extract_number_reagendar_node_executing")
+
+    user_message = state.messages[-1].content if state.messages else ""
+
+    extracted_number = None
+    pattern = r"\b[A-Z0-9]{6,10}\b"
+    matches = re.findall(pattern, user_message.upper())
+
+    if matches:
+        extracted_number = matches[0]
+    else:
+        cleaned = re.sub(r"[^A-Z0-9]", "", user_message.upper())
+        if 6 <= len(cleaned) <= 10:
+            extracted_number = cleaned
+
+    if not extracted_number:
+        extracted_number = user_message.strip()
+
+    logger.info("confirmation_number_extracted_reagendar", extracted_number=extracted_number)
+
+    return Command(update={"confirmation_number": extracted_number})
+
+
+async def validate_number_reagendar_node(state: ReagendarState) -> Command:
+    """Validate the confirmation number and store current booking."""
+    logger.info("validate_number_reagendar_node_executing", confirmation_number=state.confirmation_number)
+
+    validation_result = await validate_confirmation_number.ainvoke({"confirmation_number": state.confirmation_number})
+
+    is_valid = validation_result.get("is_valid", False)
+    current_booking = validation_result.get("booking_details", None) if is_valid else None
+    attempts = state.validation_attempts + 1
+
+    logger.info(
+        "validation_result_reagendar",
+        confirmation_number=state.confirmation_number,
+        is_valid=is_valid,
+        attempts=attempts,
+    )
+
+    return Command(update={"is_valid": is_valid, "validation_attempts": attempts, "current_booking": current_booking})
+
+
+def route_reagendar_validation(state: ReagendarState) -> str:
+    """Decide next node after validation."""
+    logger.info(
+        "route_reagendar_validation",
+        is_valid=state.is_valid,
+        attempts=state.validation_attempts,
+    )
+
+    if state.is_valid:
+        logger.info("routing_to_fetch_slots")
+        return "fetch_slots"
+
+    if state.validation_attempts < 2:
+        logger.info("routing_to_retry_validation", remaining_attempts=2 - state.validation_attempts)
+        return "retry_validation"
+
+    logger.info("routing_to_escalate_reagendar", total_attempts=state.validation_attempts)
+    return "escalate"
+
+
+async def retry_validation_reagendar_node(state: ReagendarState) -> Command:
+    """Handle validation retry (rescheduling)."""
+    logger.info("retry_validation_reagendar_node_executing", attempts=state.validation_attempts)
+
+    return Command(update={"confirmation_number": None}, goto="ask_confirmation_number")
+
+
+async def escalate_reagendar_node(state: ReagendarState) -> Command:
+    """Escalate rescheduling case to human support."""
+    logger.info("escalate_reagendar_node_executing", confirmation_number=state.confirmation_number)
+
+    escalation_result = await escalate_to_human.ainvoke(
+        {
+            "user_id": "unknown",
+            "session_id": "unknown",
+            "confirmation_number": state.confirmation_number or "none",
+            "reason": "invalid_confirmation_number_reschedule",
+        }
+    )
+
+    message_content = (
+        "Lo siento, no pudimos validar tu número de confirmación. "
+        f"{escalation_result.get('message', 'Este caso será escalado')} "
+        "Nuestro equipo te ayudará a reagendar tu cita."
+    )
+
+    response = AIMessage(content=message_content)
+    logger.info("reagendar_case_escalated", ticket_id=escalation_result.get("ticket_id"))
+
+    return Command(update={"messages": [response], "escalated": True}, goto=END)
+
+
+async def fetch_available_slots_node(state: ReagendarState) -> Command:
+    """Fetch and display available slots."""
+    logger.info("fetch_available_slots_node_executing")
+
+    # Calculate current date
+    today = datetime.now()
+    start_date = today.strftime("%Y-%m-%d")
+
+    # Call tool to get available slots
+    slots_result = await get_available_slots.ainvoke({"start_date": start_date, "duration_days": 14})
+
+    slots = slots_result.get("slots", [])
+
+    if not slots:
+        # No hay disponibilidad
+        message_content = "Lo siento, no hay citas disponibles en las próximas 2 semanas. ¿Deseas que escalemos tu caso?"
+        response = AIMessage(content=message_content)
+        return Command(update={"messages": [response], "escalated": True}, goto=END)
+
+    # Formatear mensaje con opciones
+    message_content = "Aquí están las fechas disponibles para reagendar:\n\n"
+
+    for i, slot in enumerate(slots, 1):
+        message_content += f"{i}. {slot['date']} - {slot['time']}\n"
+
+    message_content += "\nPor favor, selecciona el número de tu opción preferida."
+
+    response = AIMessage(content=message_content)
+
+    logger.info("available_slots_displayed", total_slots=len(slots))
+
+    return Command(update={"messages": [response], "available_slots": slots})
+
+
+async def extract_selection_node(state: ReagendarState) -> Command:
+    """Extract user's selection from available slots."""
+    logger.info("extract_selection_node_executing")
+
+    user_message = state.messages[-1].content if state.messages else ""
+
+    # Try to extract a number
+    try:
+        # Remove all non-digit characters and try to parse
+        numbers = re.findall(r"\d+", user_message)
+        if numbers:
+            selected_index = int(numbers[0])
+            logger.info("selection_extracted", selected_index=selected_index)
+
+            # Validate range
+            if state.available_slots and 1 <= selected_index <= len(state.available_slots):
+                selected_slot = state.available_slots[selected_index - 1]
+                return Command(
+                    update={
+                        "selected_index": selected_index,
+                        "selected_date": selected_slot["date"],
+                        "selected_time": selected_slot["time"],
+                    }
+                )
+    except (ValueError, IndexError):
+        pass
+
+    logger.warning("selection_extraction_failed", user_message=user_message)
+
+    return Command(update={"selected_index": None})
+
+
+def route_selection_validation(state: ReagendarState) -> str:
+    """Decide next node after selection."""
+    logger.info(
+        "route_selection_validation",
+        selected_index=state.selected_index,
+        selected_date=state.selected_date,
+    )
+
+    if state.selected_date and state.selected_time:
+        logger.info("routing_to_confirm_reschedule")
+        return "confirm_reschedule"
+
+    logger.info("routing_to_retry_selection")
+    return "retry_selection"
+
+
+async def retry_selection_node(state: ReagendarState) -> Command:
+    """Handle invalid selection retry."""
+    logger.info("retry_selection_node_executing")
+
+    max_option = len(state.available_slots) if state.available_slots else 0
+
+    message_content = (
+        f"Opción inválida. Por favor selecciona un número entre 1 y {max_option}.\n\n"
+        "Aquí están las opciones nuevamente:\n\n"
+    )
+
+    for i, slot in enumerate(state.available_slots, 1):
+        message_content += f"{i}. {slot['date']} - {slot['time']}\n"
+
+    response = AIMessage(content=message_content)
+
+    return Command(update={"messages": [response], "selected_index": None}, goto="extract_selection")
+
+
+async def confirm_reschedule_node(state: ReagendarState) -> Command:
+    """Confirm successful rescheduling."""
+    logger.info(
+        "confirm_reschedule_node_executing",
+        confirmation_number=state.confirmation_number,
+        new_date=state.selected_date,
+        new_time=state.selected_time,
+    )
+
+    # Call update tool
+    update_result = await update_appointment.ainvoke(
+        {
+            "confirmation_number": state.confirmation_number,
+            "new_date": state.selected_date,
+            "new_time": state.selected_time,
+        }
+    )
+
+    if update_result.get("success"):
+        message_content = (
+            f"✅ Tu cita ha sido reagendada exitosamente!\n\n"
+            f"📅 Nueva fecha: {state.selected_date}\n"
+            f"🕐 Nueva hora: {state.selected_time}\n"
+            f"📋 Número de confirmación: {state.confirmation_number}\n\n"
+            f"Recibirás un SMS de confirmación en breve."
+        )
+    else:
+        message_content = "Hubo un error al reagendar tu cita. Por favor contacta a soporte."
+
+    response = AIMessage(content=message_content)
+
+    logger.info("rescheduling_confirmed", confirmation_number=state.confirmation_number)
+
+    return Command(update={"messages": [response]}, goto=END)
+
+
+async def create_rescheduling_subgraph() -> CompiledStateGraph:
+    """Create and compile the rescheduling sub-graph.
+
+    This sub-graph handles the complete flow of rescheduling an appointment:
+    1. Ask for and validate confirmation number
+    2. Fetch available slots (2 weeks)
+    3. User selects a slot
+    4. Update appointment
+    5. Confirm rescheduling
+
+    Returns:
+        CompiledStateGraph: The compiled rescheduling sub-graph
+    """
+    logger.info("creating_rescheduling_subgraph")
+
+    builder = StateGraph(ReagendarState)
+
+    # Add nodes - Phase 1: Validation
+    builder.add_node("ask_confirmation_number", ask_confirmation_number_reagendar_node)
+    builder.add_node("extract_number", extract_number_reagendar_node)
+    builder.add_node("validate", validate_number_reagendar_node)
+    builder.add_node("retry_validation", retry_validation_reagendar_node)
+    builder.add_node("escalate", escalate_reagendar_node)
+
+    # Add nodes - Phase 2: Availability
+    builder.add_node("fetch_slots", fetch_available_slots_node)
+    builder.add_node("extract_selection", extract_selection_node)
+    builder.add_node("retry_selection", retry_selection_node)
+
+    # Add nodes - Phase 3: Confirmation
+    builder.add_node("confirm_reschedule", confirm_reschedule_node)
+
+    # Set entry point
+    builder.set_entry_point("ask_confirmation_number")
+
+    # Phase 1 edges
+    builder.add_edge("ask_confirmation_number", "extract_number")
+    builder.add_edge("extract_number", "validate")
+
+    builder.add_conditional_edges(
+        "validate",
+        route_reagendar_validation,
+        {"fetch_slots": "fetch_slots", "retry_validation": "retry_validation", "escalate": "escalate"},
+    )
+
+    # Phase 2 edges
+    builder.add_edge("fetch_slots", "extract_selection")
+
+    builder.add_conditional_edges(
+        "extract_selection",
+        route_selection_validation,
+        {"confirm_reschedule": "confirm_reschedule", "retry_selection": "retry_selection"},
+    )
+
+    # End nodes
+    builder.add_edge("confirm_reschedule", END)
+    builder.add_edge("escalate", END)
+
+    graph = builder.compile()
+
+    logger.info("rescheduling_subgraph_created")
+
+    return graph
 
 
 async def create_dating_agent_graph() -> CompiledStateGraph:
